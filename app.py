@@ -1,107 +1,336 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import joblib
+import shap
 import matplotlib.pyplot as plt
 import seaborn as sns
-import numpy as np
-import shap
+import os
+import sqlite3
+import smtplib
+import jwt
+import datetime
+from email.mime.text import MIMEText
 
-st.set_page_config(page_title="Student Performance Predictor", layout="wide")
-st.title("🎓 Student Performance Prediction System")
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    classification_report
+)
 
-# -----------------------------
-# Load model and dataset
-# -----------------------------
-model = joblib.load("models/best_model.pkl")
-df = pd.read_csv("data/student_data.csv")
+try:
+    from xgboost import XGBClassifier
+    XGB_AVAILABLE = True
+except:
+    XGB_AVAILABLE = False
 
-# -----------------------------
-# Sidebar: Student Input
-# -----------------------------
-st.sidebar.header("Enter Student Details")
 
-# Create input dictionary for all columns except target
-input_dict = {}
-for col in df.columns[:-1]:
-    if df[col].dtype == 'object':
-        options = df[col].unique()
-        value = st.sidebar.selectbox(col, options)
-        # Convert categorical to numeric using pandas category codes
-        input_dict[col] = df[col].astype('category').cat.codes[df[col] == value].values[0]
-    else:
-        value = st.sidebar.number_input(col, float(df[col].min()), float(df[col].max()))
-        input_dict[col] = value
+# =========================================================
+# CONFIG
+# =========================================================
+st.set_page_config(page_title="Enterprise Student AI System", layout="wide")
+st.title("🎓 Enterprise Student Performance AI System")
 
-# Convert to DataFrame for model
-input_df = pd.DataFrame([input_dict], columns=df.columns[:-1])
+MODEL_PATH = "models/best_model.pkl"
+DATA_PATH = "data/student_data.csv"
+DB_PATH = "database.db"
+JWT_SECRET = "supersecretkey"
 
-# -----------------------------
-# Prediction
-# -----------------------------
-if st.sidebar.button("Predict"):
-    prediction = model.predict(input_df)
-    st.success(f"Predicted Grade Category: {prediction[0]}")
 
-    # -----------------------------
-    # SHAP Explanation
-    # -----------------------------
-    st.subheader("🔍 Feature Impact on Prediction (SHAP)")
+# =========================================================
+# DATABASE INITIALIZATION
+# =========================================================
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+c = conn.cursor()
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT,
+    prediction TEXT,
+    confidence REAL
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS model_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT,
+    model_name TEXT,
+    accuracy REAL,
+    cv_score REAL
+)
+""")
+
+conn.commit()
+
+
+# =========================================================
+# JWT AUTH SYSTEM (Login First Page)
+# =========================================================
+import jwt
+import datetime
+
+JWT_SECRET = "supersecretkey"
+
+def generate_token(username):
+    payload = {
+        "user": username,
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=5)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+def verify_token(token):
     try:
-        # Create SHAP explainer
-        explainer = shap.Explainer(model.predict, input_df)
-        shap_values = explainer(input_df)
-        # Waterfall plot for single prediction
-        st.pyplot(shap.plots.waterfall(shap_values[0], show=False))
-    except Exception as e:
-        st.warning(f"SHAP explanation not available: {e}")
+        decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return decoded
+    except:
+        return None
 
-# -----------------------------
-# Data Insights
-# -----------------------------
-st.subheader("📊 Data Insights")
+# Session state
+if "token" not in st.session_state:
+    st.session_state.token = None
 
-# Class distribution
-if st.checkbox("Show Class Distribution"):
-    st.bar_chart(df.iloc[:, -1].value_counts())
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
 
-# Numerical correlation heatmap
-if st.checkbox("Show Correlation Heatmap (Numerical Only)"):
-    numerical_df = df.select_dtypes(include=[np.number])
-    if not numerical_df.empty:
-        plt.figure(figsize=(12, 8))
-        sns.heatmap(numerical_df.corr(), annot=True, cmap="coolwarm", fmt=".2f")
-        plt.title("Correlation Heatmap (Numerical Columns)", fontsize=16)
-        st.pyplot(plt)
-    else:
-        st.write("No numerical columns available for heatmap.")
+# LOGIN SCREEN
+if not st.session_state.authenticated:
 
-# Full correlation heatmap (numerical + categorical)
-if st.checkbox("Show Full Correlation (Encoded)"):
-    encoded_df = df.copy()
-    for col in encoded_df.select_dtypes(include=['object']).columns:
-        encoded_df[col] = encoded_df[col].astype('category').cat.codes
-    plt.figure(figsize=(14, 10))
-    sns.heatmap(encoded_df.corr(), annot=True, cmap="coolwarm", fmt=".2f")
-    plt.title("Correlation Heatmap (All Columns Encoded)", fontsize=16)
-    st.pyplot(plt)
+    st.title("🔐 Secure Login Required")
 
-# Global feature importance
-if st.checkbox("Show Feature Importance"):
-    try:
-        if hasattr(model, "feature_importances_"):
-            fi = pd.DataFrame({
-                "Feature": df.columns[:-1],
-                "Importance": model.feature_importances_
-            }).sort_values(by="Importance", ascending=False)
-            plt.figure(figsize=(12, 6))
-            sns.barplot(x="Importance", y="Feature", data=fi)
-            plt.title("Feature Importance", fontsize=16)
-            st.pyplot(plt)
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+
+    if st.button("Login"):
+        if username == "admin" and password == "admin123":
+            token = generate_token(username)
+            st.session_state.token = token
+            st.session_state.authenticated = True
+            st.success("Login Successful ✅")
+            st.rerun()
         else:
-            st.write("Feature importance not available for this model type.")
-    except Exception as e:
-        st.warning(f"Feature importance error: {e}")
+            st.error("Invalid Credentials")
 
-# Show raw data
-if st.checkbox("Show Raw Data"):
-    st.dataframe(df)
+    st.stop()
+
+# Verify token on reload
+decoded = verify_token(st.session_state.token)
+if not decoded:
+    st.session_state.authenticated = False
+    st.warning("Session expired. Please login again.")
+    st.stop()
+
+# Logout button
+with st.sidebar:
+    st.success(f"Logged in as {decoded['user']}")
+    if st.button("Logout"):
+        st.session_state.token = None
+        st.session_state.authenticated = False
+        st.rerun()
+
+
+# =========================================================
+# LOAD MODEL & DATA
+# =========================================================
+@st.cache_resource
+def load_model():
+    return joblib.load(MODEL_PATH)
+
+@st.cache_data
+def load_data():
+    return pd.read_csv(DATA_PATH)
+
+model = load_model()
+df = load_data()
+
+encoded_df = df.copy()
+for col in encoded_df.select_dtypes(include=['object']).columns:
+    encoded_df[col] = encoded_df[col].astype('category').cat.codes
+
+X = encoded_df.iloc[:, :-1]
+y = encoded_df.iloc[:, -1]
+
+y_pred = model.predict(X)
+
+y_true_fixed = y.astype(str)
+y_pred_fixed = pd.Series(y_pred).astype(str)
+
+accuracy = accuracy_score(y_true_fixed, y_pred_fixed)
+precision = precision_score(y_true_fixed, y_pred_fixed, average="weighted")
+recall = recall_score(y_true_fixed, y_pred_fixed, average="weighted")
+f1 = f1_score(y_true_fixed, y_pred_fixed, average="weighted")
+
+
+# =========================================================
+# KPI DASHBOARD
+# =========================================================
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Dataset Size", len(df))
+col2.metric("Accuracy", f"{round(accuracy*100,2)}%")
+col3.metric("Precision", f"{round(precision*100,2)}%")
+col4.metric("F1 Score", f"{round(f1*100,2)}%")
+
+st.divider()
+
+
+# =========================================================
+# TABS
+# =========================================================
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🔮 Prediction",
+    "📊 Analytics Dashboard",
+    "📈 Model Tracking",
+    "📧 Email Alerts",
+    "⚙️ Admin Control"
+])
+
+
+# =========================================================
+# 🔮 PREDICTION + REAL TIME DB SAVE
+# =========================================================
+with tab1:
+    st.header("Single Prediction")
+
+    input_dict = {}
+    for col in df.columns[:-1]:
+        if df[col].dtype == 'object':
+            val = st.selectbox(col, df[col].unique())
+            input_dict[col] = df[col].astype('category').cat.codes[df[col] == val].values[0]
+        else:
+            input_dict[col] = st.number_input(col, float(df[col].min()), float(df[col].max()))
+
+    input_df = pd.DataFrame([input_dict])
+
+    if st.button("Predict"):
+        prediction = model.predict(input_df)
+
+        if hasattr(model, "predict_proba"):
+            proba = np.max(model.predict_proba(input_df))
+            confidence = round(proba*100,2)
+        else:
+            confidence = None
+
+        st.success(f"Prediction: {prediction[0]}")
+
+        # Save to DB
+        c.execute("INSERT INTO predictions (timestamp, prediction, confidence) VALUES (?, ?, ?)",
+                  (str(datetime.datetime.now()), str(prediction[0]), confidence))
+        conn.commit()
+
+        if confidence and confidence < 60:
+            st.error("⚠️ Early Warning: Low Confidence Student!")
+
+        if confidence:
+            st.progress(int(confidence))
+
+
+# =========================================================
+# 📊 ANALYTICS DASHBOARD (REAL TIME)
+# =========================================================
+with tab2:
+    st.header("Prediction Trends")
+
+    pred_df = pd.read_sql_query("SELECT * FROM predictions", conn)
+
+    if not pred_df.empty:
+        pred_df["timestamp"] = pd.to_datetime(pred_df["timestamp"])
+
+        st.line_chart(pred_df["confidence"])
+
+        st.subheader("Prediction Distribution")
+        st.bar_chart(pred_df["prediction"].value_counts())
+    else:
+        st.info("No predictions logged yet.")
+
+
+# =========================================================
+# 📈 MODEL PERFORMANCE HISTORY
+# =========================================================
+with tab3:
+    st.header("Model Performance History")
+
+    history_df = pd.read_sql_query("SELECT * FROM model_history", conn)
+
+    if not history_df.empty:
+        st.dataframe(history_df)
+        st.line_chart(history_df["accuracy"])
+    else:
+        st.info("No model history available.")
+
+
+# =========================================================
+# 📧 EMAIL ALERT SYSTEM
+# =========================================================
+with tab4:
+    st.header("Send Risk Alert Email")
+
+    receiver = st.text_input("Recipient Email")
+
+    if st.button("Send Test Alert"):
+        try:
+            msg = MIMEText("⚠️ Student at risk detected.")
+            msg["Subject"] = "Student Risk Alert"
+            msg["From"] = "your_email@gmail.com"
+            msg["To"] = receiver
+
+            server = smtplib.SMTP("smtp.gmail.com", 587)
+            server.starttls()
+            server.login("your_email@gmail.com", "your_app_password")
+            server.send_message(msg)
+            server.quit()
+
+            st.success("Email Sent Successfully")
+        except Exception as e:
+            st.error(f"Email failed: {e}")
+
+
+# =========================================================
+# ⚙️ ADMIN CONTROL + MODEL RETRAINING
+# =========================================================
+with tab5:
+    if not st.session_state.authenticated:
+        st.warning("Admin login required.")
+    else:
+        st.header("Model Comparison & Retraining")
+
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+
+        models = {
+            "RandomForest": RandomForestClassifier(),
+            "LogisticRegression": LogisticRegression(max_iter=1000)
+        }
+
+        if XGB_AVAILABLE:
+            models["XGBoost"] = XGBClassifier(eval_metric="mlogloss")
+
+        results = {}
+
+        for name, m in models.items():
+            m.fit(X_train, y_train)
+            pred = m.predict(X_test)
+            acc = accuracy_score(y_test, pred)
+            cv = cross_val_score(m, X, y, cv=5).mean()
+            results[name] = {"Accuracy": acc, "CV": cv}
+
+            # Save history
+            c.execute("INSERT INTO model_history (timestamp, model_name, accuracy, cv_score) VALUES (?, ?, ?, ?)",
+                      (str(datetime.datetime.now()), name, acc, cv))
+            conn.commit()
+
+        result_df = pd.DataFrame(results).T
+        st.dataframe(result_df)
+
+        selected = st.selectbox("Select Model to Deploy", result_df.index)
+
+        if st.button("Deploy Selected Model"):
+            best_model = models[selected]
+            best_model.fit(X, y)
+            joblib.dump(best_model, MODEL_PATH)
+            st.success(f"{selected} deployed successfully!")
